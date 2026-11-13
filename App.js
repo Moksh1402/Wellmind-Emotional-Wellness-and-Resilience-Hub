@@ -1,11 +1,15 @@
 import React, { useEffect, useState } from "react";
+import smallLogo from "./favicon.ico";
+import largeLogo from "./logo.png";
 import {
   Leaf, Plus, Menu, X, Send, CloudSun, Heart, Wind,
   Sprout, Gamepad2, MessageCircle, Settings, ArrowLeft,
   Flower2, UserRound, Pencil, Save, ShieldCheck, Bell,
-  LockKeyhole, HeartHandshake,
+  LockKeyhole, HeartHandshake, LogOut,
 } from "lucide-react";
 import "./App.css";
+
+const API_BASE = "http://localhost:5000";
 
 const moodOptions = [
   { name: "Happy", emoji: "☀️" },
@@ -49,6 +53,15 @@ function createBubbleSet() {
 }
 
 function App() {
+  // Authentication and account state
+  const [authToken, setAuthToken] = useState(() => localStorage.getItem("wellmindToken") || "");
+  const [authReady, setAuthReady] = useState(false);
+  const [authMode, setAuthMode] = useState("login");
+  const [authName, setAuthName] = useState("");
+  const [authEmail, setAuthEmail] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
+  const [authError, setAuthError] = useState("");
+  const [authLoading, setAuthLoading] = useState(false);
   const [chats, setChats] = useState([]);
   const [activeChatId, setActiveChatId] = useState(null);
   const [message, setMessage] = useState("");
@@ -121,6 +134,162 @@ const [moodHistory, setMoodHistory] = useState(() => {
 
   const [profileEditing, setProfileEditing] = useState(false);
   const [profileNotice, setProfileNotice] = useState("");
+
+  async function apiRequest(path, options = {}, tokenOverride = authToken) {
+    const headers = { "Content-Type": "application/json", ...(options.headers || {}) };
+    if (tokenOverride) headers.Authorization = `Bearer ${tokenOverride}`;
+
+    const response = await fetch(`${API_BASE}${path}`, { ...options, headers });
+    let data = {};
+    try { data = await response.json(); } catch { data = {}; }
+
+    if (!response.ok) {
+      if (response.status === 401) {
+        localStorage.removeItem("wellmindToken");
+        setAuthToken("");
+        setAuthReady(true);
+        setAuthError("Your session has expired. Please log in again.");
+      }
+      const error = new Error(data.error || "Request failed. Please try again.");
+      error.status = response.status;
+      throw error;
+    }
+    return data;
+  }
+
+  async function loadWorkspace(token) {
+    const [profileData, conversationData, moodData] = await Promise.all([
+      apiRequest("/api/profile", {}, token),
+      apiRequest("/api/conversations", {}, token),
+      apiRequest("/api/moods", {}, token),
+    ]);
+
+    const user = profileData.user || {};
+    const styleMap = { friendly: "Friendly and supportive", supportive: "Friendly and supportive", calm: "Calm and professional", direct: "Simple and direct" };
+    setProfile((previous) => ({
+      ...previous,
+      name: user.name || "Your Name",
+      email: user.email || "",
+      language: user.preferred_language || "English",
+      communication: styleMap[user.communication_style] || "Friendly and supportive",
+      wellnessGoal: user.wellness_goal || "Manage stress",
+    }));
+
+    const loadedChats = (conversationData.conversations || []).map((item) => ({
+      id: Number(item.id),
+      serverId: Number(item.id),
+      title: item.title || "Conversation",
+      messages: [],
+      moodAtStart: "Not specified",
+      moodHistoryAtStart: [],
+    }));
+    setChats(loadedChats);
+
+    const loadedMoods = (moodData.moods || []).map((item) => ({
+      mood: item.mood,
+      date: item.recorded_at || new Date().toISOString(),
+    }));
+    setMoodHistory(loadedMoods);
+    if (loadedMoods.length) {
+      setSelectedMood(loadedMoods[0].mood);
+      localStorage.setItem("wellmindSelectedMood", loadedMoods[0].mood);
+    }
+
+    if (loadedChats.length) {
+      const firstChat = loadedChats[0];
+      setActiveChatId(firstChat.id);
+      const messageData = await apiRequest(`/api/conversations/${firstChat.serverId}/messages`, {}, token);
+      setChats((previous) => previous.map((chat) => chat.id === firstChat.id
+        ? { ...chat, messages: (messageData.messages || []).map((item) => ({ role: item.role, text: item.message })) }
+        : chat));
+    } else {
+      setActiveChatId(null);
+    }
+  }
+
+  useEffect(() => {
+    let cancelled = false;
+    async function initialize() {
+      if (!authToken) { setAuthReady(true); return; }
+      try {
+        await loadWorkspace(authToken);
+      } catch (error) {
+        console.error("Workspace loading error:", error);
+        if (error.status === 401) {
+          localStorage.removeItem("wellmindToken");
+          setAuthToken("");
+        } else {
+          setAuthError(error.message || "Unable to load your account data.");
+        }
+      } finally {
+        if (!cancelled) setAuthReady(true);
+      }
+    }
+    initialize();
+    return () => { cancelled = true; };
+    // Run once on initial app load. Login calls loadWorkspace explicitly.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  async function handleAuthSubmit(event) {
+    event.preventDefault();
+    setAuthError("");
+    setAuthLoading(true);
+    try {
+      const endpoint = authMode === "signup" ? "/api/auth/signup" : "/api/auth/login";
+      const response = await fetch(`${API_BASE}${endpoint}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          ...(authMode === "signup" ? { name: authName.trim() } : {}),
+          email: authEmail.trim().toLowerCase(),
+          password: authPassword,
+        }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Authentication failed.");
+      if (!data.token) throw new Error("The server did not return a login token.");
+
+      localStorage.setItem("wellmindToken", data.token);
+      setAuthToken(data.token);
+      setAuthPassword("");
+      await loadWorkspace(data.token);
+      setAuthReady(true);
+    } catch (error) {
+      setAuthError(error.message || "Unable to connect to the WellMind server.");
+    } finally {
+      setAuthLoading(false);
+    }
+  }
+
+  async function openConversation(chat) {
+    setActiveChatId(chat.id);
+    setPage("chat");
+    setMobileMenu("");
+    if (chat.messages.length || !chat.serverId) return;
+    try {
+      const data = await apiRequest(`/api/conversations/${chat.serverId}/messages`);
+      setChats((previous) => previous.map((item) => item.id === chat.id
+        ? { ...item, messages: (data.messages || []).map((entry) => ({ role: entry.role, text: entry.message })) }
+        : item));
+    } catch (error) {
+      console.error("Unable to open conversation:", error);
+    }
+  }
+
+  function logout() {
+    localStorage.removeItem("wellmindToken");
+    setAuthToken("");
+    setAuthReady(true);
+    setChats([]);
+    setActiveChatId(null);
+    setMoodHistory([]);
+    setSelectedMood("");
+    setPage("chat");
+    setAuthMode("login");
+    setAuthPassword("");
+    setAuthError("");
+  }
 
   const activeChat = chats.find(
     (chat) => chat.id === activeChatId
@@ -297,7 +466,8 @@ const [moodHistory, setMoodHistory] = useState(() => {
   // Create new conversation
   function createChat() {
   const chat = {
-    id: Date.now(),
+    id: `local-${Date.now()}`,
+    serverId: null,
     title: "New conversation",
     messages: [],
     moodAtStart: selectedMood || "Not specified",
@@ -361,34 +531,19 @@ const [moodHistory, setMoodHistory] = useState(() => {
     setIsLoading(true);
 
     try {
-      const response = await fetch(
-        "http://localhost:5000/api/chat",
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({
-  message: content,
+      const data = await apiRequest("/api/chat", {
+        method: "POST",
+        body: JSON.stringify({
+          message: content,
+          conversationId: existingChat?.serverId || null,
+          mood: existingChat?.moodAtStart || selectedMood || "Not specified",
+        }),
+      });
 
-  mood: existingChat?.moodAtStart || selectedMood || "Not specified",
-
-  moodHistory: existingChat?.moodHistoryAtStart || moodHistory.slice(-5),
-
-  communicationStyle: profile.communication,
-
-  wellnessGoal: profile.wellnessGoal,
-}),
-        }
-      );
-
-      const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(
-          data.error || "Unable to get an AI response."
-        );
-      }
+      // The backend creates a database conversation on the first message.
+      setChats((previous) => previous.map((chat) =>
+        chat.id === chatId ? { ...chat, serverId: data.conversationId } : chat
+      ));
 
       if (
         typeof data.reply !== "string" ||
@@ -442,27 +597,23 @@ const [moodHistory, setMoodHistory] = useState(() => {
   }
 
   // Mood check-in
-function selectMood(mood) {
-  const moodEntry = {
-    mood,
-    date: new Date().toISOString(),
-  };
-
+async function selectMood(mood) {
+  const moodEntry = { mood, date: new Date().toISOString() };
   setSelectedMood(mood);
-
-  setMoodHistory((previous) => {
-    const updatedHistory = [...previous, moodEntry];
-
-    localStorage.setItem(
-      "wellmindMoodHistory",
-      JSON.stringify(updatedHistory)
-    );
-
-    return updatedHistory;
-  });
-
+  setMoodHistory((previous) => [moodEntry, ...previous].slice(0, 30));
   localStorage.setItem("wellmindSelectedMood", mood);
+
+  try {
+    await apiRequest("/api/moods", {
+      method: "POST",
+      body: JSON.stringify({ mood }),
+    });
+  } catch (error) {
+    console.error("Unable to save mood to database:", error);
+    setProfileNotice("Your mood could not be synced. Please check your connection.");
+  }
 }
+
   // Navigation
   function openPage(nextPage) {
     setPage(nextPage);
@@ -477,26 +628,33 @@ function selectMood(mood) {
   }
 
   // Save profile
-  function saveProfile() {
+  async function saveProfile() {
     try {
-      localStorage.setItem(
-        "wellmindProfile",
-        JSON.stringify(profile)
-      );
+      const styleMap = {
+        "Friendly and supportive": "friendly",
+        "Calm and professional": "calm",
+        "Simple and direct": "direct",
+      };
 
-      setProfileNotice(
-        "Your profile preferences have been saved successfully."
-      );
+      await apiRequest("/api/preferences", {
+        method: "PUT",
+        body: JSON.stringify({
+          communicationStyle: styleMap[profile.communication] || "friendly",
+          wellnessGoal: profile.wellnessGoal,
+          preferredLanguage: profile.language,
+        }),
+      });
 
+      // These display-only preferences remain local because the current
+      // database schema has no columns for reminder toggles or profile edits.
+      localStorage.setItem("wellmindProfile", JSON.stringify(profile));
+      setProfileNotice("Your personalization preferences have been saved to your account.");
       setProfileEditing(false);
-    } catch {
-      setProfileNotice(
-        "Unable to save your profile. Please try again."
-      );
+    } catch (error) {
+      setProfileNotice(error.message || "Unable to save your preferences.");
     }
   }
-
-  function cancelProfileEdit() {
+    function cancelProfileEdit() {
     try {
       const saved = localStorage.getItem("wellmindProfile");
 
@@ -511,6 +669,64 @@ function selectMood(mood) {
 
     setProfileEditing(false);
     setProfileNotice("");
+  }
+
+  if (!authReady) {
+    return (
+      <div className="wellmind-auth-screen wellmind-auth-loading">
+        <div className="wellmind-auth-card">
+          <img className="wellmind-auth-logo" src={largeLogo} alt="WellMind logo" />
+          <p>Preparing your personal wellness space...</p>
+        </div>
+      </div>
+    );
+  }
+
+  if (!authToken) {
+    return (
+      <div className="wellmind-auth-screen">
+        <section className="wellmind-auth-brand-panel">
+          <div className="wellmind-auth-brand">
+            <img src={largeLogo} alt="WellMind" />
+            <span>WellMind</span>
+          </div>
+          <div className="wellmind-auth-brand-copy">
+            <div className="wellmind-auth-kicker">YOUR SPACE TO FEEL BETTER</div>
+            <h1>A healthier mind starts with a small pause.</h1>
+            <p>Take a moment for yourself. Understand your emotions, build resilience, and make space for calm — one day at a time.</p>
+          </div>
+          <div className="wellmind-auth-benefits">
+            <div className="wellmind-auth-benefit"><span className="wellmind-auth-benefit-icon"><Heart size={18} /></span><div><strong>Check in with yourself</strong><small>Notice your feelings without judging them.</small></div></div>
+            <div className="wellmind-auth-benefit"><span className="wellmind-auth-benefit-icon"><Wind size={18} /></span><div><strong>Make room for calm</strong><small>Try simple breathing and relaxation exercises.</small></div></div>
+            <div className="wellmind-auth-benefit"><span className="wellmind-auth-benefit-icon"><Sprout size={18} /></span><div><strong>Build healthy habits</strong><small>Track your mood and grow at your own pace.</small></div></div>
+          </div>
+          <div className="wellmind-auth-quote">“You don't have to have it all figured out today.”</div>
+        </section>
+        <section className="wellmind-auth-form-side">
+          <div className="wellmind-auth-card">
+            <div className="wellmind-auth-tabs" role="tablist" aria-label="Account access">
+              <button type="button" role="tab" aria-selected={authMode === "login"} className={authMode === "login" ? "active" : ""} onClick={() => { setAuthMode("login"); setAuthError(""); }}>Log in</button>
+              <button type="button" role="tab" aria-selected={authMode === "signup"} className={authMode === "signup" ? "active" : ""} onClick={() => { setAuthMode("signup"); setAuthError(""); }}>Sign up</button>
+            </div>
+            <div className="wellmind-auth-heading">
+              <div className="wellmind-auth-mini-logo"><img src={smallLogo} alt="" /></div>
+              <div className="wellmind-auth-kicker">WELCOME TO WELLMIND</div>
+              <h2>{authMode === "login" ? "Welcome back" : "Create your account"}</h2>
+              <p>{authMode === "login" ? "Log in to continue your wellness journey." : "Start building a little more balance into each day."}</p>
+            </div>
+            <form className="wellmind-auth-form" onSubmit={handleAuthSubmit}>
+              {authMode === "signup" && <label>Full name<input type="text" value={authName} onChange={(e) => setAuthName(e.target.value)} placeholder="Your name" autoComplete="name" required maxLength={100} /></label>}
+              <label>Email address<input type="email" value={authEmail} onChange={(e) => setAuthEmail(e.target.value)} placeholder="name@example.com" autoComplete="email" required /></label>
+              <label>Password<input type="password" value={authPassword} onChange={(e) => setAuthPassword(e.target.value)} placeholder="Enter your password" autoComplete={authMode === "login" ? "current-password" : "new-password"} required minLength={8} maxLength={72} /></label>
+              {authError && <div className="wellmind-auth-error" role="alert">{authError}</div>}
+              <button className="wellmind-auth-submit" type="submit" disabled={authLoading}>{authLoading ? "Please wait..." : authMode === "login" ? "Log in" : "Create account"} <span aria-hidden="true">→</span></button>
+            </form>
+            <div className="wellmind-auth-footnote"><ShieldCheck size={15} /> Your wellness space is personal and private.</div>
+          </div>
+          <p className="wellmind-auth-disclaimer">WellMind supports emotional wellness. It is not a substitute for professional mental health care.</p>
+        </section>
+      </div>
+    );
   }
 
   return (
@@ -530,7 +746,7 @@ function selectMood(mood) {
         </button>
 
         <div className="brand-mark">
-          <Flower2 size={25} />
+          <img src={smallLogo} alt="WellMind logo" />
         </div>
 
         <div className="brand-copy">
@@ -545,6 +761,10 @@ function selectMood(mood) {
         <span className="topbar-note">
           A little space for you
         </span>
+
+        <button className="icon-button wellmind-logout-button" onClick={logout} title="Log out" aria-label="Log out">
+          <LogOut size={18} />
+        </button>
 
         <button
           className="icon-button mobile-menu-button"
@@ -618,11 +838,7 @@ function selectMood(mood) {
                   className={`chat-history-item ${
                     activeChatId === chat.id ? "active" : ""
                   }`}
-                  onClick={() => {
-                    setActiveChatId(chat.id);
-                    setPage("chat");
-                    setMobileMenu("");
-                  }}
+                  onClick={() => openConversation(chat)}
                 >
                   <MessageCircle size={16} />
                   <span>{chat.title}</span>
@@ -881,8 +1097,7 @@ function selectMood(mood) {
                 </div>
 
                 <p className="muted-note">
-                  Preview data only. Database storage will
-                  be added later.
+                  Your recent mood check-ins are synced with your WellMind account.
                 </p>
               </div>
 
@@ -1096,7 +1311,7 @@ function selectMood(mood) {
                       <p>
                         Build a tiny garden, one mindful choice at a time.
                       </p>
-                    </div>
+                                          </div>
 
                     <button
                       className="secondary-button"
@@ -1622,10 +1837,7 @@ function selectMood(mood) {
                   <div className="profile-privacy-note">
                     <LockKeyhole size={16} />
                     <p>
-                      Profile preferences are currently saved
-                      in this browser only. Account authentication,
-                      server-side storage and deletion controls
-                      still need backend integration.
+                      Your account, communication style, wellness goal, language, conversations and mood check-ins are stored on the WellMind server. Reminder toggles and display-name edits are currently saved only in this browser.
                     </p>
                   </div>
                 </div>
